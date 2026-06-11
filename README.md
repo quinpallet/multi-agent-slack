@@ -101,26 +101,36 @@ bash scripts/deploy.sh
 7. **Install to Workspace** / **Reinstall App**
 8. **Basic Information** で Bot Token (`xoxb-...`) を取得
 
-### 2. Bot Token / User ID 登録
+### 2. Bot Token / User ID / Signing Secret 登録
 
-各 Bot の token と user ID を`.txt` ファイルで保存（リポジトリルート）：
+各 Bot の token、user ID、signing secret を`.txt` ファイルで保存（リポジトリルート）：
 
 ```bash
 # リポジトリルート
+# Bot Tokens (Slack App > Install > Bot User OAuth Token から)
 echo "xoxb-..." > ORCHESTRATOR_BOT_TOKEN.txt
 echo "xoxb-..." > RESEARCHER_BOT_TOKEN.txt
 echo "xoxb-..." > WRITER_BOT_TOKEN.txt
 echo "xoxb-..." > REVIEWER_BOT_TOKEN.txt
 
+# Bot User IDs (Slack で @bot-name と入力時に表示される U.... から)
 echo "U123ABC..." > ORCHESTRATOR_BOT_USER_ID.txt
 echo "U456DEF..." > RESEARCHER_BOT_USER_ID.txt
 echo "U789GHI..." > WRITER_BOT_USER_ID.txt
 echo "U0AB1CD..." > REVIEWER_BOT_USER_ID.txt
+
+# Signing Secrets (Slack App > Basic Information > Signing Secret から)
+echo "xxxx..." > ORCHESTRATOR_SIGNING_SECRET.txt
+echo "yyyy..." > RESEARCHER_SIGNING_SECRET.txt
+echo "zzzz..." > WRITER_SIGNING_SECRET.txt
+echo "wwww..." > REVIEWER_SIGNING_SECRET.txt
 ```
 
-Bot User ID は以下で確認：
-1. App Home / App Display Name の横に `@bot-name (U123...)` と表示
-2. または Slack で `@bot-name` と入力した時に表示される ID
+**または、すべての App で同じ Signing Secret を使用する場合**:
+
+```bash
+echo "xxxx..." > SLACK_SIGNING_SECRET.txt
+```
 
 ### 3. SSM へ登録
 
@@ -130,6 +140,7 @@ bash scripts/setup-ssm.sh
 
 このコマンドが以下を登録：
 - 各エージェントの Bot Token
+- 各エージェントの Signing Secret（またはフォールバック統一 secret）
 - AGENT_CONFIG JSON（User ID → SQS URL マッピング）
 
 ### 4. Bot をチャンネルに招待

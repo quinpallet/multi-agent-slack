@@ -1,251 +1,165 @@
 #!/usr/bin/env bash
-# Build and deploy the multi-agent stack: IAM role, SQS queues, DynamoDB tables,
-# receiver + processor Lambdas, SQS->processor triggers, and HTTP API. Safe to re-run.
+# Deploy multi-agent Slack bot:
+#   API Gateway -> receiver Lambda (claude-bot-handler) -> SQS -> processor Lambda
+#   + DynamoDB task table, DLQ, IAM. Idempotent.
+
 set -euo pipefail
 
 REGION="${AWS_REGION:-ap-northeast-1}"
 PREFIX="claude-bot"
-ROLE_NAME="${PREFIX}-role"
-DLQ_NAME="${PREFIX}-dlq"
-RECEIVER_FN="${PREFIX}-receiver"
-API_NAME="${PREFIX}-api"
-MODEL="${ANTHROPIC_MODEL:-claude-haiku-4-5-20251001}"
-
-# Agent configuration (add more as needed)
-declare -a AGENTS=("orchestrator" "researcher" "writer" "reviewer")
-
-cd "$(dirname "$0")/.."
+API_NAME="claude-bot-api"
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-
-echo "==> Building Lambda bundle"
-npm run package
-
-# ---------------------------------------------------------------------------
-# 1) IAM execution role (with DynamoDB permissions)
-# ---------------------------------------------------------------------------
-if ! aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
-  echo "==> Creating IAM role $ROLE_NAME"
-  aws iam create-role --role-name "$ROLE_NAME" \
-    --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}' \
-    >/dev/null
-  aws iam attach-role-policy --role-name "$ROLE_NAME" \
-    --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-  aws iam attach-role-policy --role-name "$ROLE_NAME" \
-    --policy-arn arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess
-  aws iam attach-role-policy --role-name "$ROLE_NAME" \
-    --policy-arn arn:aws:iam::aws:policy/AmazonSQSFullAccess
-  aws iam attach-role-policy --role-name "$ROLE_NAME" \
-    --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
-  echo "==> Waiting for IAM role to propagate"
-  sleep 12
-else
-  echo "==> Role already exists. Ensuring DynamoDB policy is attached..."
-  aws iam attach-role-policy --role-name "$ROLE_NAME" \
-    --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess 2>/dev/null || true
-fi
+QUEUE_NAME="${PREFIX}-queue"
+DLQ_NAME="${PREFIX}-dlq"
+TABLE_NAME="${PREFIX}-tasks"
+RECEIVER_FN="${PREFIX}-handler"     # existing function wired to API Gateway; now runs receiver
+PROCESSOR_FN="${PREFIX}-processor"
+ROLE_NAME="${PREFIX}-role"
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 
-# ---------------------------------------------------------------------------
-# 2) DynamoDB tables (task state + conversation history)
-# ---------------------------------------------------------------------------
-echo "==> Checking DynamoDB tables"
+echo "============================================================"
+echo " Multi-Agent Slack Bot Deployment"
+echo "============================================================"
 
-# Tasks table
-if ! aws dynamodb describe-table --table-name claude-bot-tasks --region "$REGION" >/dev/null 2>&1; then
-  echo "==> Creating DynamoDB table: claude-bot-tasks"
-  aws dynamodb create-table \
-    --table-name claude-bot-tasks \
-    --attribute-definitions AttributeName=taskId,AttributeType=S \
-    --key-schema AttributeName=taskId,KeyType=HASH \
-    --billing-mode PAY_PER_REQUEST \
-    --region "$REGION" >/dev/null
-  aws dynamodb wait table-exists --table-name claude-bot-tasks --region "$REGION"
-  aws dynamodb update-time-to-live \
-    --table-name claude-bot-tasks \
-    --time-to-live-specification AttributeName=ttl,Enabled=true \
-    --region "$REGION" >/dev/null 2>&1 || true
+# ---------------------------------------------------------------------------
+# 1) IAM role + inline policy (SQS / DynamoDB on top of existing SSM + logs)
+# ---------------------------------------------------------------------------
+echo "==> IAM role"
+if ! aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+  TRUST="$(mktemp)"
+  cat > "$TRUST" <<'EOF'
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}
+EOF
+  aws iam create-role --role-name "$ROLE_NAME" \
+    --assume-role-policy-document "file://$TRUST" >/dev/null
+  rm -f "$TRUST"
+  sleep 8
+fi
+aws iam attach-role-policy --role-name "$ROLE_NAME" \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole >/dev/null 2>&1 || true
+aws iam attach-role-policy --role-name "$ROLE_NAME" \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess >/dev/null 2>&1 || true
+
+POLICY="$(mktemp)"
+cat > "$POLICY" <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
+      "Resource": ["arn:aws:sqs:${REGION}:${ACCOUNT_ID}:${QUEUE_NAME}", "arn:aws:sqs:${REGION}:${ACCOUNT_ID}:${DLQ_NAME}"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"],
+      "Resource": "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/${TABLE_NAME}"
+    }
+  ]
+}
+EOF
+aws iam put-role-policy --role-name "$ROLE_NAME" \
+  --policy-name "${PREFIX}-sqs-dynamodb" --policy-document "file://$POLICY" >/dev/null
+rm -f "$POLICY"
+
+# ---------------------------------------------------------------------------
+# 2) DynamoDB table (pk only, TTL on "ttl")
+# ---------------------------------------------------------------------------
+echo "==> DynamoDB table $TABLE_NAME"
+if ! aws dynamodb describe-table --table-name "$TABLE_NAME" --region "$REGION" >/dev/null 2>&1; then
+  aws dynamodb create-table --table-name "$TABLE_NAME" \
+    --attribute-definitions AttributeName=pk,AttributeType=S \
+    --key-schema AttributeName=pk,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST --region "$REGION" >/dev/null
+  aws dynamodb wait table-exists --table-name "$TABLE_NAME" --region "$REGION"
+  aws dynamodb update-time-to-live --table-name "$TABLE_NAME" \
+    --time-to-live-specification "Enabled=true,AttributeName=ttl" --region "$REGION" >/dev/null
 fi
 
-# History table
-if ! aws dynamodb describe-table --table-name claude-bot-history --region "$REGION" >/dev/null 2>&1; then
-  echo "==> Creating DynamoDB table: claude-bot-history"
-  aws dynamodb create-table \
-    --table-name claude-bot-history \
-    --attribute-definitions \
-      AttributeName=agentId,AttributeType=S \
-      AttributeName=taskId,AttributeType=S \
-    --key-schema \
-      AttributeName=agentId,KeyType=HASH \
-      AttributeName=taskId,KeyType=RANGE \
-    --billing-mode PAY_PER_REQUEST \
-    --region "$REGION" >/dev/null
-  aws dynamodb wait table-exists --table-name claude-bot-history --region "$REGION"
-  aws dynamodb update-time-to-live \
-    --table-name claude-bot-history \
-    --time-to-live-specification AttributeName=ttl,Enabled=true \
-    --region "$REGION" >/dev/null 2>&1 || true
+# ---------------------------------------------------------------------------
+# 3) SQS queue + DLQ (visibility >= processor timeout)
+# ---------------------------------------------------------------------------
+echo "==> SQS queues"
+DLQ_URL="$(aws sqs create-queue --queue-name "$DLQ_NAME" --region "$REGION" \
+  --attributes MessageRetentionPeriod=1209600 --query QueueUrl --output text)"
+DLQ_ARN="$(aws sqs get-queue-attributes --queue-url "$DLQ_URL" --region "$REGION" \
+  --attribute-names QueueArn --query Attributes.QueueArn --output text)"
+if QUEUE_URL="$(aws sqs get-queue-url --queue-name "$QUEUE_NAME" --region "$REGION" \
+  --query QueueUrl --output text 2>/dev/null)"; then
+  aws sqs set-queue-attributes --queue-url "$QUEUE_URL" --region "$REGION" \
+    --attributes "{\"VisibilityTimeout\":\"360\",\"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"${DLQ_ARN}\\\",\\\"maxReceiveCount\\\":\\\"3\\\"}\"}"
+else
+  QUEUE_URL="$(aws sqs create-queue --queue-name "$QUEUE_NAME" --region "$REGION" \
+    --attributes "{\"VisibilityTimeout\":\"360\",\"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"${DLQ_ARN}\\\",\\\"maxReceiveCount\\\":\\\"3\\\"}\"}" \
+    --query QueueUrl --output text)"
 fi
+QUEUE_ARN="arn:aws:sqs:${REGION}:${ACCOUNT_ID}:${QUEUE_NAME}"
 
 # ---------------------------------------------------------------------------
-# 3) SQS queues (DLQ + agent-specific queues)
+# 4) Build & deploy Lambdas
 # ---------------------------------------------------------------------------
-echo "==> Setting up SQS queues"
+echo "==> Building bundle"
+npm run package
 
-# Dead-letter queue
-DLQ_URL="$(aws sqs get-queue-url --queue-name "$DLQ_NAME" --region "$REGION" \
-  --query QueueUrl --output text 2>/dev/null || true)"
-if [ -z "$DLQ_URL" ] || [ "$DLQ_URL" = "None" ]; then
-  echo "==> Creating SQS dead-letter queue $DLQ_NAME"
-  DLQ_URL="$(aws sqs create-queue --queue-name "$DLQ_NAME" \
-    --attributes MessageRetentionPeriod=1209600 --region "$REGION" --query QueueUrl --output text)"
-fi
-DLQ_ARN="$(aws sqs get-queue-attributes --queue-url "$DLQ_URL" \
-  --attribute-names QueueArn --region "$REGION" --query 'Attributes.QueueArn' --output text)"
-
-# Agent-specific queues
-declare -A QUEUE_URLS QUEUE_ARNS
-for AGENT in "${AGENTS[@]}"; do
-  QUEUE_NAME="${PREFIX}-${AGENT}"
-  QUEUE_URL="$(aws sqs get-queue-url --queue-name "$QUEUE_NAME" --region "$REGION" \
-    --query QueueUrl --output text 2>/dev/null || true)"
-  if [ -z "$QUEUE_URL" ] || [ "$QUEUE_URL" = "None" ]; then
-    echo "==> Creating SQS queue $QUEUE_NAME"
-    QUEUE_URL="$(aws sqs create-queue --queue-name "$QUEUE_NAME" \
-      --attributes VisibilityTimeout=60 --region "$REGION" --query QueueUrl --output text)"
-  fi
-
-  QUEUE_URLS["$AGENT"]="$QUEUE_URL"
-  QUEUE_ARN="$(aws sqs get-queue-attributes --queue-url "$QUEUE_URL" \
-    --attribute-names QueueArn --region "$REGION" --query 'Attributes.QueueArn' --output text)"
-  QUEUE_ARNS["$AGENT"]="$QUEUE_ARN"
-
-  # Attach redrive policy (idempotent): move to DLQ after 3 receives
-  REDRIVE_FILE="$(mktemp)"
-  printf '{"RedrivePolicy":"{\\"deadLetterTargetArn\\":\\"%s\\",\\"maxReceiveCount\\":\\"3\\"}"}' "$DLQ_ARN" > "$REDRIVE_FILE"
-  aws sqs set-queue-attributes --queue-url "$QUEUE_URL" \
-    --attributes "file://$REDRIVE_FILE" --region "$REGION"
-  rm -f "$REDRIVE_FILE"
-done
-
-# ---------------------------------------------------------------------------
-# 4) Lambda functions (create or update)
-# ---------------------------------------------------------------------------
 deploy_fn() {
-  local name="$1" handler="$2" timeout="$3" env_json="$4"
-  if aws lambda get-function --function-name "$name" --region "$REGION" >/dev/null 2>&1; then
-    echo "==> Updating function $name"
-    aws lambda update-function-code --function-name "$name" \
+  local fn="$1" handler="$2" timeout="$3" env="$4"
+  if aws lambda get-function --function-name "$fn" --region "$REGION" >/dev/null 2>&1; then
+    aws lambda update-function-code --function-name "$fn" \
       --zip-file fileb://lambda.zip --region "$REGION" >/dev/null
-    aws lambda wait function-updated --function-name "$name" --region "$REGION"
-    aws lambda update-function-configuration --function-name "$name" \
-      --handler "$handler" --timeout "$timeout" --runtime nodejs24.x --role "$ROLE_ARN" \
-      --environment "$env_json" --region "$REGION" >/dev/null
+    aws lambda wait function-updated --function-name "$fn" --region "$REGION"
+    aws lambda update-function-configuration --function-name "$fn" \
+      --handler "$handler" --timeout "$timeout" --memory-size 512 \
+      --environment "$env" --runtime nodejs24.x --region "$REGION" >/dev/null
+    aws lambda wait function-updated --function-name "$fn" --region "$REGION"
   else
-    echo "==> Creating function $name"
-    aws lambda create-function --function-name "$name" --runtime nodejs24.x \
-      --role "$ROLE_ARN" --handler "$handler" --timeout "$timeout" \
-      --zip-file fileb://lambda.zip --environment "$env_json" --region "$REGION" >/dev/null
+    aws lambda create-function --function-name "$fn" --runtime nodejs24.x \
+      --role "$ROLE_ARN" --handler "$handler" --timeout "$timeout" --memory-size 512 \
+      --environment "$env" --zip-file fileb://lambda.zip --region "$REGION" >/dev/null
+    aws lambda wait function-active --function-name "$fn" --region "$REGION"
   fi
-  aws lambda wait function-updated --function-name "$name" --region "$REGION"
+  echo "  ✅ $fn ($handler)"
 }
 
-# Build AGENT_CONFIG JSON
-AGENT_CONFIG="{}"
-for AGENT in "${AGENTS[@]}"; do
-  # Placeholder: Bot user IDs must be manually verified and updated in SSM
-  BOT_USER_ID="U_${AGENT^^}_ID"
-  AGENT_CONFIG=$(echo "$AGENT_CONFIG" | jq \
-    --arg agent "$AGENT" \
-    --arg userId "$BOT_USER_ID" \
-    --arg queueUrl "${QUEUE_URLS[$AGENT]}" \
-    --arg tokenParam "/claude-bot/${AGENT^^}_BOT_TOKEN" \
-    '.[$agent] = {userId: $userId, sqsQueueUrl: $queueUrl, botTokenParam: $tokenParam}')
-done
+deploy_fn "$RECEIVER_FN" "receiver.handler" 30 "Variables={QUEUE_URL=${QUEUE_URL}}"
+deploy_fn "$PROCESSOR_FN" "processor.handler" 300 "Variables={TASKS_TABLE=${TABLE_NAME}}"
 
-# Receiver Lambda
-deploy_fn "$RECEIVER_FN" "receiver.handler" 10 \
-  "{\"Variables\":{\"AGENT_CONFIG_PARAM\":\"/claude-bot/AGENT_CONFIG\"}}"
-
-# Processor Lambdas (one per agent)
-for AGENT in "${AGENTS[@]}"; do
-  PROCESSOR_FN="${PREFIX}-processor-${AGENT}"
-  deploy_fn "$PROCESSOR_FN" "processor.handler" 60 \
-    "{\"Variables\":{\"AGENT_NAME\":\"${AGENT}\",\"SLACK_BOT_TOKEN_PARAM\":\"/claude-bot/${AGENT^^}_BOT_TOKEN\",\"ANTHROPIC_API_KEY_PARAM\":\"/claude-bot/ANTHROPIC_API_KEY\",\"ANTHROPIC_MODEL\":\"${MODEL}\"}}"
-done
+# SQS -> processor event source mapping (batch size 1)
+echo "==> SQS event source mapping"
+MAPPING="$(aws lambda list-event-source-mappings --function-name "$PROCESSOR_FN" \
+  --event-source-arn "$QUEUE_ARN" --region "$REGION" --query 'EventSourceMappings[0].UUID' --output text)"
+if [ -z "$MAPPING" ] || [ "$MAPPING" = "None" ]; then
+  aws lambda create-event-source-mapping --function-name "$PROCESSOR_FN" \
+    --event-source-arn "$QUEUE_ARN" --batch-size 1 --region "$REGION" >/dev/null
+  echo "  ✅ created"
+else
+  aws lambda update-event-source-mapping --uuid "$MAPPING" --enabled --region "$REGION" >/dev/null
+  echo "  ✅ exists ($MAPPING, enabled)"
+fi
 
 # ---------------------------------------------------------------------------
-# 5) SQS -> processor triggers
+# 5) HTTP API (reuse existing; integration already targets $RECEIVER_FN)
 # ---------------------------------------------------------------------------
-echo "==> Setting up SQS -> processor event source mappings"
-for AGENT in "${AGENTS[@]}"; do
-  PROCESSOR_FN="${PREFIX}-processor-${AGENT}"
-  QUEUE_ARN="${QUEUE_ARNS[$AGENT]}"
-
-  # Check if mapping already exists
-  if ! aws lambda list-event-source-mappings --function-name "$PROCESSOR_FN" --region "$REGION" \
-      --query "EventSourceMappings[?EventSourceArn=='$QUEUE_ARN'].UUID" --output text | grep -q .; then
-    echo "==> Creating SQS -> $PROCESSOR_FN event source mapping"
-    aws lambda create-event-source-mapping --function-name "$PROCESSOR_FN" \
-      --event-source-arn "$QUEUE_ARN" --batch-size 1 --region "$REGION" >/dev/null
-  fi
-done
-
-# ---------------------------------------------------------------------------
-# 6) HTTP API (API Gateway v2)
-# ---------------------------------------------------------------------------
-echo "==> Setting up HTTP API"
+echo "==> HTTP API"
 API_ID="$(aws apigatewayv2 get-apis --region "$REGION" \
   --query "Items[?Name=='${API_NAME}'].ApiId | [0]" --output text)"
 if [ -z "$API_ID" ] || [ "$API_ID" = "None" ]; then
-  echo "==> Creating HTTP API $API_NAME"
   API_ID="$(aws apigatewayv2 create-api --name "$API_NAME" --protocol-type HTTP \
+    --target "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${RECEIVER_FN}" \
     --region "$REGION" --query ApiId --output text)"
+  aws lambda add-permission --function-name "$RECEIVER_FN" \
+    --statement-id "AllowAPIGateway-$API_ID" --action lambda:InvokeFunction \
+    --principal apigateway.amazonaws.com --region "$REGION" >/dev/null 2>&1 || true
 fi
+STAGE_NAME="$(aws apigatewayv2 get-stages --api-id "$API_ID" --region "$REGION" \
+  --query 'Items[0].StageName' --output text 2>/dev/null || echo prod)"
 
-RECEIVER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${RECEIVER_FN}"
-
-# Reuse an existing integration for this API if one is already present.
-INTEGRATION_ID="$(aws apigatewayv2 get-integrations --api-id "$API_ID" --region "$REGION" \
-  --query 'Items[0].IntegrationId | [0]' --output text 2>/dev/null || true)"
-if [ -z "$INTEGRATION_ID" ] || [ "$INTEGRATION_ID" = "None" ]; then
-  INTEGRATION_ID="$(aws apigatewayv2 create-integration --api-id "$API_ID" \
-    --integration-type AWS_PROXY --integration-uri "$RECEIVER_ARN" \
-    --payload-format-version 2.0 --region "$REGION" --query IntegrationId --output text)"
-fi
-
-aws apigatewayv2 create-route --api-id "$API_ID" --route-key 'POST /slack/events' \
-  --target "integrations/${INTEGRATION_ID}" --region "$REGION" >/dev/null 2>&1 || true
-aws apigatewayv2 create-stage --api-id "$API_ID" --stage-name prod --auto-deploy \
-  --region "$REGION" >/dev/null 2>&1 || true
-
-aws lambda add-permission --function-name "$RECEIVER_FN" --statement-id apigw-invoke \
-  --action lambda:InvokeFunction --principal apigateway.amazonaws.com \
-  --source-arn "arn:aws:execute-api:${REGION}:${ACCOUNT_ID}:${API_ID}/*/*/slack/events" \
-  --region "$REGION" >/dev/null 2>&1 || true
-
-ENDPOINT="https://${API_ID}.execute-api.${REGION}.amazonaws.com/prod/slack/events"
-
-# ---------------------------------------------------------------------------
-# 7) Summary
-# ---------------------------------------------------------------------------
 echo ""
 echo "============================================================"
-echo " Multi-Agent Deploy Complete"
+echo " Deployment Complete"
 echo ""
-echo " Slack Event Subscriptions Request URL:"
-echo "   $ENDPOINT"
+echo " Request URL: https://${API_ID}.execute-api.${REGION}.amazonaws.com/${STAGE_NAME}/slack/events"
+echo " Queue:       ${QUEUE_URL}"
+echo " Table:       ${TABLE_NAME}"
 echo ""
-echo " Next steps:"
-echo "   1. Register agent Bot Tokens in SSM:"
-echo "      aws ssm put-parameter --name /claude-bot/ORCHESTRATOR_BOT_TOKEN --value 'xoxb-...' --type SecureString --region $REGION"
-echo "      aws ssm put-parameter --name /claude-bot/RESEARCHER_BOT_TOKEN --value 'xoxb-...' --type SecureString --region $REGION"
-echo "      aws ssm put-parameter --name /claude-bot/WRITER_BOT_TOKEN --value 'xoxb-...' --type SecureString --region $REGION"
-echo "      aws ssm put-parameter --name /claude-bot/REVIEWER_BOT_TOKEN --value 'xoxb-...' --type SecureString --region $REGION"
-echo ""
-echo "   2. Update agent User IDs in SSM /claude-bot/AGENT_CONFIG:"
-echo "      (Get each bot's User ID from Slack, e.g., U123ABC...)"
-echo ""
-echo "   3. Register AGENT_CONFIG in SSM:"
-echo "      bash scripts/setup-ssm.sh"
-echo ""
+echo " Prompts/AGENT_CONFIG: bash scripts/setup-prompts.sh"
 echo "============================================================"

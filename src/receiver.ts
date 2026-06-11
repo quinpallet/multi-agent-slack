@@ -1,44 +1,40 @@
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
-import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import type { APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2 } from 'aws-lambda';
 import { getSecret } from './lib/ssm';
 import { verifySlackSignature } from './lib/slack';
+import { loadAgentConfig, agentByBotId, agentByUserId, AGENT_NAMES, AgentName } from './lib/config';
 
+const QUEUE_URL = process.env.QUEUE_URL ?? '';
 const sqs = new SQSClient({});
-const ssm = new SSMClient({});
-const SIGNING_SECRET_PARAM =
-  process.env.SLACK_SIGNING_SECRET_PARAM ?? '/claude-bot/SLACK_SIGNING_SECRET';
-const AGENT_CONFIG_PARAM =
-  process.env.AGENT_CONFIG_PARAM ?? '/claude-bot/AGENT_CONFIG';
 
-interface AgentConfig {
-  userId: string;
-  sqsQueueUrl: string;
-  botTokenParam: string;
+const SIGNING_SECRET_PARAMS = [
+  '/claude-bot/SIGNING_SECRET_ORCHESTRATOR',
+  '/claude-bot/SIGNING_SECRET_RESEARCHER',
+  '/claude-bot/SIGNING_SECRET_WRITER',
+  '/claude-bot/SIGNING_SECRET_REVIEWER',
+];
+
+export interface AgentJob {
+  agent: AgentName;
+  channel: string;
+  threadTs: string;
+  msgTs: string;
+  text: string;
+  /** Human sender's user ID, if the message came from a human. */
+  senderUserId?: string;
+  /** Sending agent's name, if the message came from one of our bots. */
+  senderAgent?: AgentName;
+  eventId?: string;
 }
 
-async function getAgentConfig(): Promise<Record<string, AgentConfig>> {
-  try {
-    const res = await ssm.send(
-      new GetParameterCommand({ Name: AGENT_CONFIG_PARAM, WithDecryption: false }),
-    );
-    return JSON.parse(res.Parameter?.Value ?? '{}');
-  } catch {
-    console.warn(`Agent config not found at ${AGENT_CONFIG_PARAM}`);
-    return {};
-  }
+async function verifyWithAnySecret(
+  headers: Record<string, string | undefined>,
+  rawBody: string,
+): Promise<boolean> {
+  const secrets = await Promise.all(SIGNING_SECRET_PARAMS.map((p) => getSecret(p)));
+  return secrets.some((s) => s && verifySlackSignature(s, headers, rawBody));
 }
 
-function extractMentionedBotId(text: string): string {
-  const match = text.match(/^<@([A-Z0-9]+)>/);
-  return match?.[1] ?? '';
-}
-
-/**
- * API Gateway entry point. Validates the Slack request, routes app_mention
- * events to the appropriate agent's SQS queue, and returns 200 immediately
- * (Slack requires a response within 3 seconds).
- */
 export const handler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyStructuredResultV2> => {
@@ -55,13 +51,6 @@ export const handler = async (
     return { statusCode: 400, body: 'invalid json' };
   }
 
-  console.log('request received', {
-    type: body.type,
-    eventType: body.event?.type,
-    hasSlackSig: Boolean(event.headers?.['x-slack-signature']),
-  });
-
-  // Slack URL verification — only sent once while enabling Event Subscriptions.
   if (body.type === 'url_verification') {
     return {
       statusCode: 200,
@@ -70,50 +59,63 @@ export const handler = async (
     };
   }
 
-  // Verify the request really came from Slack. Skipped (with a warning) if the
-  // signing secret has not been registered in SSM yet.
-  const signingSecret = await getSecret(SIGNING_SECRET_PARAM);
-  if (signingSecret) {
-    if (!verifySlackSignature(signingSecret, event.headers ?? {}, rawBody)) {
-      console.warn('signature verification FAILED — request rejected (401)');
-      return { statusCode: 401, body: 'invalid signature' };
-    }
-  } else {
-    console.warn(
-      `Signing secret ${SIGNING_SECRET_PARAM} is not set in SSM — skipping signature verification. ` +
-        'Set it to secure this endpoint.',
-    );
+  if (!(await verifyWithAnySecret(event.headers ?? {}, rawBody))) {
+    console.warn('[receiver] signature verification failed');
+    return { statusCode: 401, body: 'invalid signature' };
   }
 
-  // Ignore bot messages to prevent loops.
-  if (body.event?.bot_id) {
-    console.info('Ignoring bot message to prevent infinite loop');
+  const ev = body.event;
+  if (ev?.type !== 'app_mention') {
     return { statusCode: 200, body: 'ok' };
   }
 
-  // Route app_mention to the target agent's SQS queue.
-  if (body.event?.type === 'app_mention') {
-    const slackEvent = body.event;
-    const mentionedBotId = extractMentionedBotId(slackEvent.text);
+  const cfg = await loadAgentConfig();
 
-    const agentConfig = await getAgentConfig();
-    const targetAgent = Object.entries(agentConfig).find(
-      ([_, a]) => a.userId === mentionedBotId,
-    );
-
-    if (targetAgent) {
-      const [agentName, agent] = targetAgent;
-      await sqs.send(
-        new SendMessageCommand({
-          QueueUrl: agent.sqsQueueUrl,
-          MessageBody: JSON.stringify(slackEvent),
-        }),
-      );
-      console.log(`Routed app_mention to ${agentName}`, { queueUrl: agent.sqsQueueUrl });
-    } else {
-      console.warn(`Unknown bot mentioned: ${mentionedBotId}`);
+  // Identify the sender: a human, one of our 4 agents, or a foreign bot.
+  let senderAgent: AgentName | undefined;
+  if (ev.bot_id) {
+    senderAgent = agentByBotId(cfg, ev.bot_id);
+    if (!senderAgent) {
+      console.info(`[receiver] ignoring message from non-allowlisted bot ${ev.bot_id}`);
+      return { statusCode: 200, body: 'ok' };
     }
   }
 
+  const text = String(ev.text ?? '');
+  const mentionedIds = [...text.matchAll(/<@(U[A-Z0-9]+)>/g)].map((m) => m[1]);
+  const targets = [...new Set(mentionedIds)]
+    .map((id) => agentByUserId(cfg, id))
+    .filter((a): a is AgentName => Boolean(a) && a !== senderAgent);
+
+  if (targets.length === 0) {
+    return { statusCode: 200, body: 'ok' };
+  }
+
+  console.log('[receiver] routing', {
+    sender: senderAgent ?? ev.user,
+    targets,
+    channel: ev.channel,
+    eventId: body.event_id,
+  });
+
+  await Promise.all(
+    targets.map((agent) => {
+      const job: AgentJob = {
+        agent,
+        channel: ev.channel,
+        threadTs: ev.thread_ts ?? ev.ts,
+        msgTs: ev.ts,
+        text,
+        senderUserId: ev.user,
+        senderAgent,
+        eventId: body.event_id,
+      };
+      return sqs.send(new SendMessageCommand({ QueueUrl: QUEUE_URL, MessageBody: JSON.stringify(job) }));
+    }),
+  );
+
   return { statusCode: 200, body: 'ok' };
 };
+
+// Re-export for processor-side type imports.
+export { AGENT_NAMES };
