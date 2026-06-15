@@ -11,10 +11,12 @@ const sqsMock = mockClient(SQSClient);
 const SECRET = 'test-signing-secret';
 
 const CFG = {
-  orchestrator: { userId: 'U0ORCH', botId: 'B_ORCH', botTokenParam: '/p/o' },
-  researcher: { userId: 'U0RES', botId: 'B_RES', botTokenParam: '/p/r' },
-  writer: { userId: 'U0WRI', botId: 'B_WRI', botTokenParam: '/p/w' },
-  reviewer: { userId: 'U0REV', botId: 'B_REV', botTokenParam: '/p/v' },
+  orchestrator: { userId: 'U0ORCH', botId: 'B_ORCH', botTokenParam: '/p/o', signingSecretParam: '/s/o' },
+  researcher: { userId: 'U0RES', botId: 'B_RES', botTokenParam: '/p/r', signingSecretParam: '/s/r' },
+  writer: { userId: 'U0WRI', botId: 'B_WRI', botTokenParam: '/p/w', signingSecretParam: '/s/w' },
+  reviewer: { userId: 'U0REV', botId: 'B_REV', botTokenParam: '/p/v', signingSecretParam: '/s/v' },
+  // コード変更なしで AGENT_CONFIG に追加された新エージェント
+  translator: { userId: 'U0TRA', botId: 'B_TRA', botTokenParam: '/p/t', signingSecretParam: '/s/t' },
 };
 
 function makeEvent(payload: object, opts: { signed?: boolean } = { signed: true }): any {
@@ -41,7 +43,8 @@ beforeEach(() => {
   vi.mocked(getSecret).mockReset();
   vi.mocked(getSecret).mockImplementation(async (name: string) => {
     if (name === '/claude-bot/AGENT_CONFIG') return JSON.stringify(CFG);
-    if (name.startsWith('/claude-bot/SIGNING_SECRET')) return SECRET;
+    // Signing Secret は AGENT_CONFIG の signingSecretParam が指すパラメータから取る
+    if (name.startsWith('/s/')) return SECRET;
     return '';
   });
 });
@@ -149,6 +152,17 @@ describe('receiver.handler', () => {
       makeEvent(appMention({ user: 'U0HUMAN', text: '<@U0SOMEONE> hi', channel: 'C1', ts: '1.2' })),
     );
     expect(sentJobs()).toHaveLength(0);
+  });
+
+  it('設定に追加しただけの新エージェント宛メンションもルーティングされる（拡張性）', async () => {
+    await handler(
+      makeEvent(
+        appMention({ user: 'U0HUMAN', text: '<@U0TRA> 翻訳してください', channel: 'C1', ts: '1.2' }),
+      ),
+    );
+    const jobs = sentJobs();
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].agent).toBe('translator');
   });
 
   it('app_mention 以外のイベントは無視する', async () => {

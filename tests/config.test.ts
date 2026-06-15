@@ -1,14 +1,19 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { loadAgentConfig, agentByUserId, agentByBotId, AgentConfig } from '../src/lib/config';
+import { loadAgentConfig, agentNames, agentByUserId, agentByBotId, AgentConfig } from '../src/lib/config';
 import { getSecret } from '../src/lib/ssm';
 
 vi.mock('../src/lib/ssm', () => ({ getSecret: vi.fn() }));
 
 const FIXTURE: AgentConfig = {
-  orchestrator: { userId: 'U_ORCH', botId: 'B_ORCH', botTokenParam: '/p/o' },
-  researcher: { userId: 'U_RES', botId: 'B_RES', botTokenParam: '/p/r' },
-  writer: { userId: 'U_WRI', botId: 'B_WRI', botTokenParam: '/p/w' },
-  reviewer: { userId: 'U_REV', botId: 'B_REV', botTokenParam: '/p/v' },
+  orchestrator: {
+    userId: 'U_ORCH', botId: 'B_ORCH', botTokenParam: '/p/o', signingSecretParam: '/s/o',
+    mentionLimits: { writer: 3 },
+  },
+  researcher: { userId: 'U_RES', botId: 'B_RES', botTokenParam: '/p/r', signingSecretParam: '/s/r' },
+  writer: { userId: 'U_WRI', botId: 'B_WRI', botTokenParam: '/p/w', signingSecretParam: '/s/w' },
+  reviewer: { userId: 'U_REV', botId: 'B_REV', botTokenParam: '/p/v', signingSecretParam: '/s/v' },
+  // コード変更なしで追加された新エージェント（AGENT_CONFIG に足すだけ）
+  translator: { userId: 'U_TRA', botId: 'B_TRA', botTokenParam: '/p/t', signingSecretParam: '/s/t' },
 };
 
 beforeEach(() => {
@@ -29,6 +34,14 @@ describe('loadAgentConfig', () => {
   });
 });
 
+describe('agentNames', () => {
+  it('AGENT_CONFIG のキーがそのままエージェント一覧になる（固定リストを持たない）', () => {
+    expect(agentNames(FIXTURE)).toEqual([
+      'orchestrator', 'researcher', 'writer', 'reviewer', 'translator',
+    ]);
+  });
+});
+
 describe('agentByUserId / agentByBotId', () => {
   it('userId からエージェント名を逆引きする', () => {
     expect(agentByUserId(FIXTURE, 'U_WRI')).toBe('writer');
@@ -38,5 +51,10 @@ describe('agentByUserId / agentByBotId', () => {
   it('botId からエージェント名を逆引きする（許可リスト判定に使用）', () => {
     expect(agentByBotId(FIXTURE, 'B_REV')).toBe('reviewer');
     expect(agentByBotId(FIXTURE, 'B_FOREIGN')).toBeUndefined();
+  });
+
+  it('設定に追加しただけの新エージェントも逆引きできる（拡張性）', () => {
+    expect(agentByUserId(FIXTURE, 'U_TRA')).toBe('translator');
+    expect(agentByBotId(FIXTURE, 'B_TRA')).toBe('translator');
   });
 });

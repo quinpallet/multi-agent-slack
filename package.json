@@ -11,7 +11,7 @@
     "deploy": "bash scripts/deploy.sh"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.30.1",
+    "@anthropic-ai/sdk": "^0.104.1",
     "@aws-sdk/client-dynamodb": "^3.700.0",
     "@aws-sdk/client-sqs": "^3.700.0",
     "@aws-sdk/client-ssm": "^3.700.0",

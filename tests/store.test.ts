@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { mockClient } from 'aws-sdk-client-mock';
-import { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, DeleteCommand, GetCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { ConditionalCheckFailedException } from '@aws-sdk/client-dynamodb';
-import { claimEvent, bumpHops, bumpWriterMentions, appendHistory, findTaskIdByThread } from '../src/lib/store';
+import { claimEvent, releaseEvent, bumpHops, decrementHops, bumpMentionCount, appendHistory, findTaskIdByThread } from '../src/lib/store';
 
 const ddbMock = mockClient(DynamoDBDocumentClient);
 
@@ -31,6 +31,13 @@ describe('claimEvent（重複排除）', () => {
     ddbMock.on(PutCommand).rejects(new Error('throughput exceeded'));
     await expect(claimEvent('k')).rejects.toThrow('throughput exceeded');
   });
+
+  it('releaseEvent はクレームを削除してリトライ可能にする', async () => {
+    ddbMock.on(DeleteCommand).resolves({});
+    await releaseEvent('C1:123.456:researcher');
+    const input = ddbMock.commandCalls(DeleteCommand)[0].args[0].input;
+    expect(input.Key?.pk).toBe('event#C1:123.456:researcher');
+  });
 });
 
 describe('カウンタ（ホップ・修正回数ガードの基盤）', () => {
@@ -40,14 +47,22 @@ describe('カウンタ（ホップ・修正回数ガードの基盤）', () => {
 
     const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
     expect(input.Key?.pk).toBe('task#t1');
-    expect(input.UpdateExpression).toBe('ADD #a :one');
+    expect(input.UpdateExpression).toBe('ADD #a :d');
+    expect(input.ExpressionAttributeValues).toEqual({ ':d': 1 });
   });
 
-  it('bumpWriterMentions は writerMentions を更新する', async () => {
-    ddbMock.on(UpdateCommand).resolves({ Attributes: { writerMentions: 4 } });
-    expect(await bumpWriterMentions('t1')).toBe(4);
+  it('decrementHops は -1 を加算する（失敗ターンのホップ返却）', async () => {
+    ddbMock.on(UpdateCommand).resolves({ Attributes: { hops: 6 } });
+    expect(await decrementHops('t1')).toBe(6);
     const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
-    expect(input.ExpressionAttributeNames).toEqual({ '#a': 'writerMentions' });
+    expect(input.ExpressionAttributeValues).toEqual({ ':d': -1 });
+  });
+
+  it('bumpMentionCount は「from->to」ペアごとの独立カウンタを更新する', async () => {
+    ddbMock.on(UpdateCommand).resolves({ Attributes: { 'mentions:orchestrator->writer': 4 } });
+    expect(await bumpMentionCount('t1', 'orchestrator', 'writer')).toBe(4);
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.ExpressionAttributeNames).toEqual({ '#a': 'mentions:orchestrator->writer' });
   });
 });
 

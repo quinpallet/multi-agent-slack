@@ -1,7 +1,10 @@
+// =============================================================================
+// slack.ts — Slack Web API クライアント（署名検証・メッセージ投稿・ファイル添付）
+// =============================================================================
 import crypto from 'crypto';
 
 /**
- * Verify that a request genuinely came from Slack using the signing secret.
+ * リクエストが本物の Slack から来たことを Signing Secret で検証する。
  * https://api.slack.com/authentication/verifying-requests-from-slack
  */
 export function verifySlackSignature(
@@ -13,13 +16,14 @@ export function verifySlackSignature(
   const signature = headers['x-slack-signature'];
   if (!timestamp || !signature) return false;
 
-  // Reject requests older than 5 minutes to mitigate replay attacks.
+  // リプレイ攻撃対策：5分より古いリクエストは署名が正しくても拒否する
   if (Math.abs(Date.now() / 1000 - Number(timestamp)) > 60 * 5) return false;
 
   const base = `v0:${timestamp}:${rawBody}`;
   const expected =
     'v0=' + crypto.createHmac('sha256', signingSecret).update(base).digest('hex');
 
+  // タイミング攻撃対策のため通常の文字列比較ではなく timingSafeEqual を使う
   const a = Buffer.from(expected);
   const b = Buffer.from(signature);
   if (a.length !== b.length) return false;
@@ -29,10 +33,14 @@ export function verifySlackSignature(
 export interface PostMessageArgs {
   channel: string;
   text: string;
+  /** 指定するとそのスレッドへの返信になる。省略時はチャンネル直下に投稿 */
   thread_ts?: string;
 }
 
-/** Post a message to Slack via chat.postMessage. */
+/**
+ * chat.postMessage でメッセージを投稿する。
+ * Slack API は HTTP 200 でも ok:false でエラーを返すため、必ず ok を確認する。
+ */
 export async function postMessage(botToken: string, args: PostMessageArgs): Promise<void> {
   const res = await fetch('https://slack.com/api/chat.postMessage', {
     method: 'POST',
@@ -53,15 +61,21 @@ export interface UploadFileArgs {
   threadTs?: string;
   filename: string;
   content: string;
+  /** 添付メッセージに付けるコメント（task_id 付与済みの文字列を渡す） */
   initialComment?: string;
 }
 
 /**
- * Upload a file via the files.uploadV2 flow
- * (getUploadURLExternal -> raw POST -> completeUploadExternal).
- * Note: getUploadURLExternal only accepts form-urlencoded args, not JSON.
+ * files.uploadV2 相当の3ステップでファイルを添付する：
+ *   1. files.getUploadURLExternal でアップロード先 URL を取得
+ *   2. その URL へファイル本体を直接 POST
+ *   3. files.completeUploadExternal でチャンネル・スレッドへの共有を確定
+ * 注意: getUploadURLExternal は form-urlencoded しか受け付けない
+ * （JSON で送ると invalid_arguments になる。検証済みの仕様）。
  */
 export async function uploadFile(botToken: string, args: UploadFileArgs): Promise<void> {
+  // length はファイルのバイト数。日本語等のマルチバイト文字があるため
+  // 文字数ではなく Buffer.byteLength で算出する
   const form = new URLSearchParams({
     filename: args.filename,
     length: String(Buffer.byteLength(args.content, 'utf-8')),
@@ -89,6 +103,7 @@ export async function uploadFile(botToken: string, args: UploadFileArgs): Promis
     throw new Error(`Slack file upload failed: HTTP ${upRes.status}`);
   }
 
+  // 共有確定。thread_ts を渡すことで成果物がタスクのスレッド内に添付される
   const completeRes = await fetch('https://slack.com/api/files.completeUploadExternal', {
     method: 'POST',
     headers: {

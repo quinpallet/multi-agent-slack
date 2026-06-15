@@ -1,0 +1,16 @@
+{
+  "orchestrator": {
+    "description": "プロジェクトマネージャー。依頼を受けて工程を計画し、各エージェントに作業を指示する司令塔",
+    "mentionLimits": { "writer": 3 }
+  },
+  "researcher": {
+    "description": "リサーチャー。指示されたテーマを Web 検索を活用して調査し、調査結果をまとめて報告する",
+    "webSearch": true
+  },
+  "writer": {
+    "description": "ライター。調査結果をもとにレポートを執筆し、成果物として提出する"
+  },
+  "reviewer": {
+    "description": "レビュアー。成果物を品質チェックし、承認（approved）または修正指摘（needs_fix）を判定する"
+  }
+}

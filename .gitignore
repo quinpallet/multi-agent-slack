@@ -2,4 +2,3 @@ node_modules/
 dist/
 lambda.zip
 .history/
-prompts/

@@ -52,7 +52,7 @@ cat > "$POLICY" <<EOF
     },
     {
       "Effect": "Allow",
-      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"],
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"],
       "Resource": "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/${TABLE_NAME}"
     }
   ]
@@ -86,11 +86,12 @@ DLQ_ARN="$(aws sqs get-queue-attributes --queue-url "$DLQ_URL" --region "$REGION
   --attribute-names QueueArn --query Attributes.QueueArn --output text)"
 if QUEUE_URL="$(aws sqs get-queue-url --queue-name "$QUEUE_NAME" --region "$REGION" \
   --query QueueUrl --output text 2>/dev/null)"; then
+  # VisibilityTimeout は processor の Lambda タイムアウト（900s）より長くする
   aws sqs set-queue-attributes --queue-url "$QUEUE_URL" --region "$REGION" \
-    --attributes "{\"VisibilityTimeout\":\"360\",\"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"${DLQ_ARN}\\\",\\\"maxReceiveCount\\\":\\\"3\\\"}\"}"
+    --attributes "{\"VisibilityTimeout\":\"960\",\"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"${DLQ_ARN}\\\",\\\"maxReceiveCount\\\":\\\"3\\\"}\"}"
 else
   QUEUE_URL="$(aws sqs create-queue --queue-name "$QUEUE_NAME" --region "$REGION" \
-    --attributes "{\"VisibilityTimeout\":\"360\",\"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"${DLQ_ARN}\\\",\\\"maxReceiveCount\\\":\\\"3\\\"}\"}" \
+    --attributes "{\"VisibilityTimeout\":\"960\",\"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"${DLQ_ARN}\\\",\\\"maxReceiveCount\\\":\\\"3\\\"}\"}" \
     --query QueueUrl --output text)"
 fi
 QUEUE_ARN="arn:aws:sqs:${REGION}:${ACCOUNT_ID}:${QUEUE_NAME}"
@@ -121,7 +122,8 @@ deploy_fn() {
 }
 
 deploy_fn "$RECEIVER_FN" "receiver.handler" 30 "Variables={QUEUE_URL=${QUEUE_URL}}"
-deploy_fn "$PROCESSOR_FN" "processor.handler" 300 "Variables={TASKS_TABLE=${TABLE_NAME}}"
+# 900s: Web 検索ありの researcher が複数ラウンドの生成+検索を完走できる長さ
+deploy_fn "$PROCESSOR_FN" "processor.handler" 900 "Variables={TASKS_TABLE=${TABLE_NAME}}"
 
 # SQS -> processor event source mapping (batch size 1)
 echo "==> SQS event source mapping"
